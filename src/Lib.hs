@@ -23,6 +23,7 @@ module Lib
    -- | "Initializer" payloads, and smart constructors thereof.
    mkDefaultSetup
   ,defaultSetup
+  ,writePretty
   ,
    -- | For now
    pretty')
@@ -32,22 +33,28 @@ import           Data.Aeson                 (ToJSON (..), (.!=), (.:), (.=))
 import qualified Data.Aeson.Encode.Pretty   as A (encodePretty)
 import           Data.Aeson.Types           (object)
 import qualified Data.Aeson.Types           as AT
-import qualified Data.ByteString.Lazy.Char8 as BS (unpack)
-import qualified Data.Colour                as C (Colour)
-import qualified Data.Colour.Names          as Colours
-import qualified Data.Colour.SRGB           as C (RGB (..), toSRGB24)
+
+import qualified Data.ByteString.Lazy       as BS (ByteString (..), writeFile)
+import qualified Data.ByteString.Lazy.Char8 as BS (pack, unpack)
+import           Data.Monoid                ((<>))
+
+import           Data.Colour                (Colour (..))
+import qualified Data.Colour.Names          as Colors
+import           Data.Colour.SRGB           (RGB (..))
+import qualified Data.Colour.SRGB           as C (toSRGB24)
+
 import           Data.Text                  (Text)
-import qualified Data.Text                  as T (pack, toLower, unpack)
-import qualified Data.Text.Encoding         as T (decodeUtf8)
--- import           Control.Lens               hiding ((.=))
+import qualified Data.Text                  as T (pack, toLower)
+
+import           Control.Lens               hiding ((.=))
 import           GHC.Exts                   (fromList)
 import           GHC.Word                   (Word8)
 
-type BentoColor = C.Colour Double
+type BentoColor = Colour Double
 
 instance ToJSON BentoColor where
   toJSON c =
-    let (C.RGB r g b) = C.toSRGB24 c
+    let (RGB r g b) = C.toSRGB24 c
     in object ["red" .= r,"green" .= g,"blue" .= b]
 
 data VisibilityState
@@ -109,8 +116,8 @@ data FontSetting =
 
 instance ToJSON FontSetting where
   toJSON FontSetting{..} =
-    object (["data" .= toJSON _font,"type" .= AT.String _fontType'] ++
-            extraPairs)
+    object $
+    ["data" .= toJSON _font,"type" .= AT.String _fontType'] ++ extraPairs
     where (_fontType',extraPairs) =
             case _fontType of
               (IndexedFont ix) -> ("indexed",["index" .= ix])
@@ -118,7 +125,7 @@ instance ToJSON FontSetting where
               BoldFont         -> ("bold",[])
               NormalFont       -> ("normal",[])
 
-data ColourType
+data ColorType
   =
     -- | Background color
     Background
@@ -135,10 +142,17 @@ lowerName :: (Show a)
           => a -> Text
 lowerName = T.toLower . T.pack . show
 
-instance ToJSON ColourType where
+instance ToJSON ColorType where
   toJSON = toJSON . lowerName
 
-type ColorSetting = (ColourType,BentoColor)
+data ColorSetting =
+  ColorSetting {_colorType :: ColorType
+               ,_color     :: BentoColor}
+  deriving (Show,Eq)
+
+instance ToJSON ColorSetting where
+  toJSON ColorSetting{..} = object ["name" .= lowerName _colorType
+                                   ,"data" .= _color]
 
 data BarProperty
   =
@@ -155,23 +169,18 @@ data BarProperty
     Visibility VisibilityState
   deriving (Show,Eq)
 
--- | TODO fix this
-helper :: (Show a
-          ,ToJSON b)
-       => (a,b) -> AT.Pair
-helper (ct,c) = (T.pack ("FIXME " ++ show ct)) .= (toJSON c)
+mkColorSettings :: [(ColorType, BentoColor)] -> BarProperty
+mkColorSettings = ColorSettings . map (uncurry ColorSetting)
 
-helper' :: (Show a
-           ,ToJSON b)
-        => Text -> [(a,b)] -> AT.Value
-helper' x = wrappedProperty x . object . map helper
+mkFontSettings :: [(FontType, Font)] -> BarProperty
+mkFontSettings = FontSettings . map (uncurry FontSetting)
 
 instance ToJSON BarProperty where
   toJSON (Contents t) = wrappedProperty "contents" t
   toJSON (Visibility s) =
     wrappedProperty "hidden"
                     (s == Hidden)
-  toJSON (ColorSettings xs) = helper' "colors" xs
+  toJSON (ColorSettings xs) = wrappedProperty "colors" (map toJSON xs)
   toJSON (FontSettings xs) = wrappedProperty "fonts" (map toJSON xs)
 
 data Command
@@ -216,6 +225,10 @@ data Payload =
            _targetBar :: BarIdent}
   deriving (Show,Eq)
 
+makeLenses ''Font
+makeLenses ''FontSetting
+makeLenses ''Payload
+
 instance ToJSON Payload where
   toJSON (Payload cmds bar) = object ["bar_name" .= bar,"commands" .= cmds]
 
@@ -223,22 +236,21 @@ mkDefaultSetup :: (FontFace -> Font) -- ^ The font to use.
                -> Text -- ^ The name of the bar.
                -> Payload -- ^ A payload that initializes the bar.
 mkDefaultSetup f = Payload props
-  where props = map SetProp [colours,fonts,contents]
+  where props = Repaint : map SetProp [colours,fonts,contents]
         contents = Contents "Some text here"
         colours =
-          ColorSettings
-            [(Background,Colours.black)
-            ,(Foreground,Colours.white)
-            ,(Success,Colours.green)
-            ,(Warning,Colours.yellow)
-            ,(Failure,Colours.red)]
+          mkColorSettings
+            [(Background,Colors.black)
+            ,(Foreground,Colors.white)
+            ,(Success,Colors.green)
+            ,(Warning,Colors.yellow)
+            ,(Failure,Colors.red)]
         fonts =
-          FontSettings $
-          map (uncurry FontSetting)
-              [(NormalFont,f Normal)
-              ,(BoldFont,f Bold)
-              ,(IndexedFont 1,Font "Serif" 12 Normal)
-              ,(NamedFont "Sans",Font "Sans" 12 Normal)]
+          mkFontSettings
+            [(NormalFont,f Normal)
+            ,(BoldFont,f Bold)
+            ,(IndexedFont 1,Font "Serif" 12 Normal)
+            ,(NamedFont "Sans",Font "Sans" 12 Normal)]
 
 defaultSetup :: Payload
 defaultSetup = mkDefaultSetup iosevkaWithFace barName
@@ -253,6 +265,12 @@ pretty = BS.unpack . A.encodePretty
 pretty' :: ToJSON a
         => a -> IO ()
 pretty' = putStrLn . pretty
+
+writePretty :: ToJSON a
+            => FilePath -> a -> IO ()
+writePretty path val = BS.writeFile path val'
+  where val' = A.encodePretty val <> eofMarker
+        eofMarker = BS.pack "\n\0"
 
 barName :: Text
 barName = "top/cpu"
